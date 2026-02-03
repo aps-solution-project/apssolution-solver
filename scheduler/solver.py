@@ -1,3 +1,4 @@
+import json
 import collections
 from ortools.sat.python import cp_model
 
@@ -6,16 +7,21 @@ def flatten_data(data: dict):
     rows = []
 
     for product in data["scenarioProductList"]:
-        job_id = product["id"]
+        product_id = product["id"]
+        quantity = product.get("qty", 1)
 
-        for task in product["scenarioTasks"]:
-            rows.append({
-                "job_id": job_id,
-                "task_id": task["id"],
-                "seq": task["seq"],
-                "duration": task["duration"],
-                "tool_category_id": task.get("toolCategory", {}).get("id"),
-            })
+        for i in range(quantity):
+            job_id = f"{product_id}__{i+1}"
+
+            for task in product["scenarioTasks"]:
+                rows.append({
+                    "job_id": job_id,
+                    "product_id": product_id,
+                    "task_id": task["id"],
+                    "seq": task["seq"],
+                    "duration": task["duration"],
+                    "tool_category_id": task.get("toolCategory", {}).get("id"),
+                })
 
     rows.sort(key=lambda r: (r["job_id"], r["seq"]))
     return rows
@@ -29,22 +35,15 @@ def group_by_job(rows):
 
 
 def build_tools_by_category(tools: list):
-    """
-    toolCategoryId -> [toolId, toolId, ...]
-    """
     result = collections.defaultdict(list)
-
     for tool in tools:
-        category_id = tool["category"]["id"]
-        result[category_id].append(tool["id"])
-
+        result[tool["category"]["id"]].append(tool["id"])
     return dict(result)
 
 
 def solve_scenario(data: dict):
     rows = flatten_data(data)
     jobs = group_by_job(rows)
-
     tools_by_category = build_tools_by_category(data["tools"])
 
     horizon = sum(r["duration"] for r in rows)
@@ -53,7 +52,6 @@ def solve_scenario(data: dict):
 
     var_map = {}
     all_end_vars = []
-
     worker_intervals = []
     tool_intervals = collections.defaultdict(list)
 
@@ -70,14 +68,12 @@ def solve_scenario(data: dict):
                 model.add(start >= prev_end)
             prev_end = end
 
-            # worker 1명 소모
             worker_iv = model.new_interval_var(
                 start, task["duration"], end,
                 f"iv_worker_{job_id}_{task['seq']}"
             )
             worker_intervals.append(worker_iv)
 
-            # toolCategory
             if task["tool_category_id"]:
                 tool_iv = model.new_interval_var(
                     start, task["duration"], end,
@@ -90,29 +86,20 @@ def solve_scenario(data: dict):
                 "end": end,
                 "duration": task["duration"],
                 "tool_category_id": task["tool_category_id"],
+                "product_id": task["product_id"],
             }
 
             all_end_vars.append(end)
 
-    # 1) 작업자 수 제한
-    model.add_cumulative(
-        worker_intervals,
-        [1] * len(worker_intervals),
-        data["scenario"]["maxWorkerCount"]
-    )
+    model.add_cumulative(worker_intervals, [1] * len(worker_intervals),
+                         data["scenario"]["maxWorkerCount"])
 
-    # 2) toolCategory capacity 제한
     for tool_category_id, intervals in tool_intervals.items():
         tools = tools_by_category.get(tool_category_id, [])
-
         if not tools:
             raise ValueError(f"Tool category not available: {tool_category_id}")
 
-        model.add_cumulative(
-            intervals,
-            [1] * len(intervals),
-            len(tools)
-        )
+        model.add_cumulative(intervals, [1] * len(intervals), len(tools))
 
     makespan = model.new_int_var(0, horizon, "makespan")
     model.add_max_equality(makespan, all_end_vars)
@@ -121,62 +108,62 @@ def solve_scenario(data: dict):
     solver = cp_model.CpSolver()
     status = solver.solve(model)
 
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return {"status": solver.status_name(status), "makespan": 0, "schedules": []}
+
     timeline = []
 
     for (job_id, task_id), v in var_map.items():
         timeline.append({
-            "productId": job_id,
-            "taskId": task_id,
-            "toolCategoryId": v["tool_category_id"],
-            "toolId": None,
+            "job_id": job_id,
+            "product_id": v["product_id"],
+            "task_id": task_id,
+            "tool_category_id": v["tool_category_id"],
+            "tool_id": None,
             "start": solver.value(v["start"]),
             "end": solver.value(v["end"]),
             "duration": v["duration"],
         })
 
-    # toolCategory별 작업 정렬
     tasks_by_category = collections.defaultdict(list)
     for t in timeline:
-        if t["toolCategoryId"]:
-            tasks_by_category[t["toolCategoryId"]].append(t)
+        if t["tool_category_id"]:
+            tasks_by_category[t["tool_category_id"]].append(t)
 
     for tool_category_id, tasks in tasks_by_category.items():
         tool_ids = tools_by_category[tool_category_id]
-
-        # tool_id -> 해당 tool의 마지막 종료 시간
         tool_available_at = {tool_id: 0 for tool_id in tool_ids}
 
-        # 시작 시간 기준 정렬
         tasks.sort(key=lambda x: x["start"])
 
         for task in tasks:
             for tool_id, available_at in tool_available_at.items():
                 if available_at <= task["start"]:
-                    task["toolId"] = tool_id
+                    task["tool_id"] = tool_id
                     tool_available_at[tool_id] = task["end"]
                     break
 
-            if task["toolId"] is None:
-                raise RuntimeError(
-                    f"Tool assignment failed: {tool_category_id} at {task}"
-                )
+            if task["tool_id"] is None:
+                raise RuntimeError(f"Tool assignment failed: {tool_category_id}")
 
-    status_name = solver.status_name(status)
+    return {
+        "status": solver.status_name(status),
+        "makespan": solver.value(makespan),
+        "schedules": timeline,
+    }
 
-    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return {
-            "status": status_name,
-            "makespan": solver.value(makespan),
-            "timeline": timeline,
-        }
-    else:
-        return {
-            "status": status_name,
-            "makespan": 0,
-            "timeline": [],
-        }
 
+# ---------------- 실행용 메인 ---------------- #
 
 if __name__ == "__main__":
-    data = "test"
-    solve_scenario(data)
+    with open("input.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    result = solve_scenario(data)
+
+    print("\n=== SOLVER RESULT ===")
+    print("Status   :", result["status"])
+    print("Makespan :", result["makespan"])
+    print("\nSchedules:")
+    for s in sorted(result["schedules"], key=lambda x: (x["start"], x["job_id"])):
+        print(s)
