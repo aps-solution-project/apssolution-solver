@@ -1,8 +1,50 @@
 import json
 import collections
 from ortools.sat.python import cp_model
+import time
+from ortools.sat.python import cp_model
 
 NO_EQUIPMENT = "NO_EQUIPMENT"
+
+# -------------------------------
+# 중간 해 출력 콜백 (해 하나 나올 때마다 무조건 출력)
+# -------------------------------
+import time
+from ortools.sat.python import cp_model
+
+
+class ProgressSolutionPrinter(cp_model.CpSolverSolutionCallback):
+    def __init__(self, makespan_var, interval_sec=5):
+        super().__init__()
+        self._makespan = makespan_var
+        self._solution_count = 0
+        self._last_print_time = time.time()
+        self._interval = interval_sec
+        self._best_makespan = None
+
+    def on_solution_callback(self):
+        self._solution_count += 1
+        self._best_makespan = self.Value(self._makespan)
+
+        print(
+            f"[Solution #{self._solution_count}] "
+            f"time={self.WallTime():.1f}s "
+            f"makespan={self._best_makespan}"
+        )
+
+        self._maybe_print_progress()
+
+    def _maybe_print_progress(self):
+        now = time.time()
+        if now - self._last_print_time >= self._interval:
+            bound = self.BestObjectiveBound()
+            print(
+                f"[Progress] time={self.WallTime():.1f}s "
+                f"best={self._best_makespan} "
+                f"bound={bound}"
+            )
+            self._last_print_time = now
+
 
 
 # -------------------------------
@@ -34,7 +76,7 @@ def flatten_data(data: dict):
 
 
 # -------------------------------
-# 2. Product 그룹화 (기존 job 그룹화와 동일)
+# 2. Product 그룹화
 # -------------------------------
 def group_by_product(rows):
     products = collections.defaultdict(list)
@@ -70,7 +112,6 @@ def solve_scenario(data: dict):
 
     worker_intervals = []
     worker_demands = []
-
     tool_intervals = collections.defaultdict(list)
 
     # ---------------------------
@@ -80,27 +121,25 @@ def solve_scenario(data: dict):
         prev_end = None
 
         for task in tasks:
-            start = model.new_int_var(0, horizon, f"s_{product_instance_id}_{task['seq']}")
-            end = model.new_int_var(0, horizon, f"e_{product_instance_id}_{task['seq']}")
+            start = model.NewIntVar(0, horizon, f"s_{product_instance_id}_{task['seq']}")
+            end = model.NewIntVar(0, horizon, f"e_{product_instance_id}_{task['seq']}")
 
-            model.add(end == start + task["duration"])
+            model.Add(end == start + task["duration"])
 
             if prev_end is not None:
-                model.add(start >= prev_end)
+                model.Add(start >= prev_end)
             prev_end = end
 
-            # 👷 작업 인력 interval
-            worker_iv = model.new_interval_var(
+            worker_iv = model.NewIntervalVar(
                 start, task["duration"], end,
                 f"iv_worker_{product_instance_id}_{task['seq']}"
             )
             worker_intervals.append(worker_iv)
             worker_demands.append(task["required_workers"])
 
-            # 🛠 설비 interval
             tool_cat = task["tool_category_id"]
             if tool_cat and tool_cat != NO_EQUIPMENT:
-                tool_iv = model.new_interval_var(
+                tool_iv = model.NewIntervalVar(
                     start, task["duration"], end,
                     f"iv_tool_{tool_cat}_{product_instance_id}_{task['seq']}"
                 )
@@ -118,37 +157,44 @@ def solve_scenario(data: dict):
             all_end_vars.append(end)
 
     # ---------------------------
-    # 👷 인력 Cumulative 제약
+    # 인력 Cumulative
     # ---------------------------
-    model.add_cumulative(
+    model.AddCumulative(
         worker_intervals,
         worker_demands,
         data["scenario"]["maxWorkerCount"]
     )
 
     # ---------------------------
-    # 🛠 설비 Cumulative 제약
+    # 설비 Cumulative
     # ---------------------------
     for tool_category_id, intervals in tool_intervals.items():
         tools = tools_by_category.get(tool_category_id, [])
         if not tools:
             raise ValueError(f"Tool category not available: {tool_category_id}")
 
-        model.add_cumulative(intervals, [1] * len(intervals), len(tools))
+        model.AddCumulative(intervals, [1] * len(intervals), len(tools))
 
     # ---------------------------
     # Makespan 최소화
     # ---------------------------
-    makespan = model.new_int_var(0, horizon, "makespan")
-    model.add_max_equality(makespan, all_end_vars)
-    model.minimize(makespan)
+    makespan = model.NewIntVar(0, horizon, "makespan")
+    model.AddMaxEquality(makespan, all_end_vars)
+    model.Minimize(makespan)
 
+    # ---------------------------
+    # Solver 실행 + 콜백
+    # ---------------------------
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 590
-    status = solver.solve(model)
+    solver.parameters.max_time_in_seconds = 43000
+    solver.parameters.log_search_progress = False
+
+    solution_printer = ProgressSolutionPrinter(makespan, interval_sec=1)
+
+    status = solver.Solve(model, solution_printer)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return {"status": solver.status_name(status), "makespan": 0, "schedules": []}
+        return {"status": solver.StatusName(status), "makespan": 0, "schedules": []}
 
     # ---------------------------
     # 결과 타임라인 생성
@@ -162,14 +208,14 @@ def solve_scenario(data: dict):
             "task_id": task_id,
             "tool_category_id": v["tool_category_id"],
             "tool_id": None,
-            "start": solver.value(v["start"]),
-            "end": solver.value(v["end"]),
+            "start": solver.Value(v["start"]),
+            "end": solver.Value(v["end"]),
             "duration": v["duration"],
             "required_workers": v["required_workers"],
         })
 
     # ---------------------------
-    # 실제 Tool ID 배정 (후처리)
+    # Tool ID 후처리 배정
     # ---------------------------
     tasks_by_category = collections.defaultdict(list)
     for t in timeline:
@@ -193,23 +239,20 @@ def solve_scenario(data: dict):
                 raise RuntimeError(f"Tool assignment failed: {tool_category_id}")
 
     return {
-        "status": solver.status_name(status),
-        "makespan": solver.value(makespan),
+        "status": solver.StatusName(status),
+        "makespan": solver.Value(makespan),
         "schedules": timeline,
     }
 
 
 # -------------------------------
-# 실행용 메인
+# 실행 테스트용
 # -------------------------------
 if __name__ == "__main__":
-    data = ""
+    data = {}
 
     result = solve_scenario(data)
 
     print("\n=== SOLVER RESULT ===")
     print("Status   :", result["status"])
     print("Makespan :", result["makespan"])
-    print("\nSchedules:")
-    for s in sorted(result["schedules"], key=lambda x: (x["start"], x["product_instance_id"])):
-        print(s)
