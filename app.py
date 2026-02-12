@@ -8,9 +8,10 @@ app = Flask(__name__)
 @app.route('/api/solve', methods=['POST'])
 def job_simulation_solver():
     data = request.get_json()
-    resp = solve_scenario(data)
+    print("\n📩 Solve request received")
 
-    # time.sleep(len(resp["timeline"]) / 7)
+    resp = solve_scenario(data)
+    print("✅ Solve finished\n\n")
     return resp
 
 
