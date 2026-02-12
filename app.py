@@ -9,8 +9,9 @@ app = Flask(__name__)
 def job_simulation_solver():
     data = request.get_json()
     print("\n📩 Solve request received")
+
     resp = solve_scenario(data)
-    print("✅ Solve finished\n")
+    print("✅ Solve finished\n\n")
     return resp
 
 
