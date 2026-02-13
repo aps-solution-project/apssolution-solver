@@ -35,7 +35,7 @@ def flatten_data(data):
         qty = product.get("qty", 1)
 
         for i in range(qty):
-            pid = f"{product_id}__{i + 1}"
+            pid = f"{product_id}__{i+1}"
             for task in product["scenarioTasks"]:
                 rows.append({
                     "product_instance_id": pid,
@@ -72,27 +72,10 @@ def build_tool_to_category_map(tools):
 # 메인 Solver
 # -------------------------------
 def solve_scenario(data):
-    """
-    data: Java SolveScenarioRequest 객체 (JSON 형태)
-    {
-        "scenario": {...},
-        "scenarioProductList": [...],
-        "tools": [...],
-        "accounts": [{"id": "...", "name": "..."}, ...]
-    }
-    """
     rows = flatten_data(data)
     products = group_by_product(rows)
     tools_by_category = build_tools_by_category(data["tools"])
     tool_to_category = build_tool_to_category_map(data["tools"])
-
-    # accounts에서 id만 추출
-    accounts = data.get("accounts", [])
-    account_ids = [acc["id"] for acc in accounts]
-    num_accounts = len(account_ids)
-
-    if num_accounts == 0:
-        raise ValueError("최소 1명 이상의 account가 필요합니다.")
 
     horizon = sum(r["duration"] for r in rows)
 
@@ -109,23 +92,12 @@ def solve_scenario(data):
     # 🔥 핵심: 같은 task_id 전역 직렬화
     task_intervals_by_task_id = collections.defaultdict(list)
 
-    # 🆕 각 account별로 배정된 interval을 추적 (중복 방지용)
-    account_intervals = collections.defaultdict(list)
-
-    # 🆕 각 작업에 배정될 작업자들을 저장할 변수
-    task_worker_assignments = {}
-
-    task_counter = 0  # 각 작업에 고유 ID 부여
-
     for pid, tasks in products.items():
         prev_end = None
 
         for task in tasks:
-            task_counter += 1
-            unique_task_key = f"{pid}_{task['task_id']}_{task_counter}"
-
-            start = model.NewIntVar(0, horizon, f"s_{unique_task_key}")
-            end = model.NewIntVar(0, horizon, f"e_{unique_task_key}")
+            start = model.NewIntVar(0, horizon, f"s_{pid}_{task['seq']}")
+            end = model.NewIntVar(0, horizon, f"e_{pid}_{task['seq']}")
             model.Add(end == start + task["duration"])
 
             if prev_end is not None:
@@ -134,7 +106,7 @@ def solve_scenario(data):
 
             interval = model.NewIntervalVar(
                 start, task["duration"], end,
-                f"iv_{unique_task_key}"
+                f"iv_{pid}_{task['task_id']}"
             )
 
             # Worker
@@ -149,69 +121,25 @@ def solve_scenario(data):
             # 🔥 같은 task_id 묶기
             task_intervals_by_task_id[task["task_id"]].append(interval)
 
-            # 🆕 작업자 배정 변수 생성 (0명 또는 1명만)
-            required_workers = task["required_workers"]
-            assigned_worker = None  # 배정된 작업자 변수
-
-            if required_workers == 1:
-                # 어떤 account가 배정될지 선택 변수
-                worker_var = model.NewIntVar(
-                    0, num_accounts - 1,
-                    f"worker_{unique_task_key}"
-                )
-                assigned_worker = worker_var
-
-                # 각 account에 대해 optional interval 생성
-                for acc_idx, acc_id in enumerate(account_ids):
-                    # 이 account가 배정되었을 때만 활성화
-                    is_assigned = model.NewBoolVar(
-                        f"assigned_{unique_task_key}_{acc_id}"
-                    )
-                    model.Add(worker_var == acc_idx).OnlyEnforceIf(is_assigned)
-
-                    # Optional interval: 이 account가 배정되었을 때만 활성화
-                    opt_interval = model.NewOptionalIntervalVar(
-                        start, task["duration"], end,
-                        is_assigned,
-                        f"opt_iv_{unique_task_key}_{acc_id}"
-                    )
-
-                    # 이 account의 interval 리스트에 추가
-                    account_intervals[acc_id].append(opt_interval)
-
-            task_worker_assignments[unique_task_key] = {
+            var_map[(pid, task["task_id"])] = {
                 "start": start,
                 "end": end,
                 "duration": task["duration"],
                 "tool_category_id": cat,
                 "product_id": task["product_id"],
-                "task_id": task["task_id"],
                 "required_workers": task["required_workers"],
-                "assigned_worker": assigned_worker,  # 단일 변수
             }
-
-            var_map[(pid, task["task_id"], task_counter)] = task_worker_assignments[unique_task_key]
 
             all_end_vars.append(end)
 
     # -------------------------------
     # 제약 조건
     # -------------------------------
-    # requiredWorkers > 0인 작업만 동시 작업 인원 제약 적용
-    worker_intervals_filtered = []
-    worker_demands_filtered = []
-
-    for interval, demand in zip(worker_intervals, worker_demands):
-        if demand > 0:
-            worker_intervals_filtered.append(interval)
-            worker_demands_filtered.append(demand)
-
-    if worker_intervals_filtered:
-        model.AddCumulative(
-            worker_intervals_filtered,
-            worker_demands_filtered,
-            data["scenario"]["maxWorkerCount"] // 2
-        )
+    model.AddCumulative(
+        worker_intervals,
+        worker_demands,
+        data["scenario"]["maxWorkerCount"]//2
+    )
 
     for cat, intervals in tool_intervals.items():
         model.AddCumulative(
@@ -224,46 +152,12 @@ def solve_scenario(data):
     for task_id, intervals in task_intervals_by_task_id.items():
         model.AddNoOverlap(intervals)
 
-    # 🆕 각 account별로 시간 겹침 방지 (동일 작업자 중복 배정 불가)
-    for acc_id, intervals in account_intervals.items():
-        if len(intervals) > 0:
-            model.AddNoOverlap(intervals)
-
-    # 🆕🆕🆕 동시에 배정 가능한 작업자 수 제한 (maxWorkerCount / 2)
-    # requiredWorkers > 0인 작업만 카운트
-    max_concurrent_workers = data["scenario"]["maxWorkerCount"] // 2
-
-    # 모든 작업의 시작/종료 시점에서 동시 배정된 작업자 수 체크
-    worker_assignment_intervals = []
-    worker_assignment_demands = []
-
-    for unique_task_key, task_info in task_worker_assignments.items():
-        # requiredWorkers > 0이고 작업자가 배정된 작업만 카운트
-        if task_info["required_workers"] > 0 and task_info["assigned_worker"] is not None:
-            # 이 작업에 작업자가 배정되면 1명으로 카운트
-            worker_assignment_intervals.append(
-                model.NewIntervalVar(
-                    task_info["start"],
-                    task_info["duration"],
-                    task_info["end"],
-                    f"worker_count_iv_{unique_task_key}"
-                )
-            )
-            worker_assignment_demands.append(1)
-
-    if worker_assignment_intervals:
-        model.AddCumulative(
-            worker_assignment_intervals,
-            worker_assignment_demands,
-            max_concurrent_workers
-        )
-
     makespan = model.NewIntVar(0, horizon, "makespan")
     model.AddMaxEquality(makespan, all_end_vars)
     model.Minimize(makespan)
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 300
+    solver.parameters.max_time_in_seconds = 43200
     solver.parameters.log_search_progress = True
 
     status = solver.Solve(
@@ -283,12 +177,7 @@ def solve_scenario(data):
     # 결과 생성
     # -------------------------------
     timeline = []
-    for (pid, tid, counter), v in var_map.items():
-        # 배정된 작업자 ID 추출 (0명 또는 1명)
-        account_id = None
-        if v["assigned_worker"] is not None:
-            account_id = account_ids[solver.Value(v["assigned_worker"])]
-
+    for (pid, tid), v in var_map.items():
         timeline.append({
             "product_id": v["product_id"],
             "task_id": tid,
@@ -298,7 +187,6 @@ def solve_scenario(data):
             "end": solver.Value(v["end"]),
             "duration": v["duration"],
             "required_workers": v["required_workers"],
-            "accountId": account_id,  # 🆕 작업자 ID (null 또는 단일 값)
         })
 
     # -------------------------------
@@ -352,7 +240,7 @@ def solve_scenario(data):
         t["duration"] * t["required_workers"] for t in timeline
     )
     worker_util = total_worker_time / (
-            total_time * data["scenario"]["maxWorkerCount"]
+        total_time * data["scenario"]["maxWorkerCount"]
     )
 
     idle_times = []
@@ -382,7 +270,7 @@ def solve_scenario(data):
 
     total_equipment_time = sum(tool_usage.values())
     total_equipment_capacity = (
-            sum(len(v) for v in tools_by_category.values()) * total_time
+        sum(len(v) for v in tools_by_category.values()) * total_time
     )
     equipment_util = (
         total_equipment_time / total_equipment_capacity
