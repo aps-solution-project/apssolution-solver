@@ -68,6 +68,16 @@ def build_tool_to_category_map(tools):
     return {t["id"]: t["category"]["id"] for t in tools}
 
 
+def is_day_shift(end_time_minutes):
+    """
+    종료 시간이 주간 근무 시간(06:00-18:00)에 속하는지 확인
+    end_time_minutes: 하루 내 분 단위 시간 (0-1439)
+    """
+    # 06:00 = 360분, 18:00 = 1080분
+    time_of_day = end_time_minutes % 1440  # 24시간 = 1440분
+    return 360 <= time_of_day < 1080
+
+
 # -------------------------------
 # 메인 Solver
 # -------------------------------
@@ -78,7 +88,8 @@ def solve_scenario(data):
         "scenario": {...},
         "scenarioProductList": [...],
         "tools": [...],
-        "accounts": [{"id": "...", "name": "..."}, ...]
+        "dayWorkers": [{"id": "...", "name": "..."}, ...],
+        "nightWorkers": [{"id": "...", "name": "..."}, ...]
     }
     """
     rows = flatten_data(data)
@@ -86,13 +97,18 @@ def solve_scenario(data):
     tools_by_category = build_tools_by_category(data["tools"])
     tool_to_category = build_tool_to_category_map(data["tools"])
 
-    # accounts에서 id만 추출
-    accounts = data.get("accounts", [])
-    account_ids = [acc["id"] for acc in accounts]
-    num_accounts = len(account_ids)
+    # 주간/야간 작업자 분리
+    day_workers = data.get("dayWorkers", [])
+    night_workers = data.get("nightWorkers", [])
 
-    if num_accounts == 0:
-        raise ValueError("최소 1명 이상의 account가 필요합니다.")
+    day_worker_ids = [acc["id"] for acc in day_workers]
+    night_worker_ids = [acc["id"] for acc in night_workers]
+
+    num_day_workers = len(day_worker_ids)
+    num_night_workers = len(night_worker_ids)
+
+    if num_day_workers == 0 and num_night_workers == 0:
+        raise ValueError("최소 1명 이상의 작업자가 필요합니다.")
 
     horizon = sum(r["duration"] for r in rows)
 
@@ -110,7 +126,8 @@ def solve_scenario(data):
     task_intervals_by_task_id = collections.defaultdict(list)
 
     # 🆕 각 account별로 배정된 interval을 추적 (중복 방지용)
-    account_intervals = collections.defaultdict(list)
+    day_account_intervals = collections.defaultdict(list)
+    night_account_intervals = collections.defaultdict(list)
 
     # 🆕 각 작업에 배정될 작업자들을 저장할 변수
     task_worker_assignments = {}
@@ -151,33 +168,100 @@ def solve_scenario(data):
 
             # 🆕 작업자 배정 변수 생성 (0명 또는 1명만)
             required_workers = task["required_workers"]
-            assigned_worker = None  # 배정된 작업자 변수
+            assigned_worker_info = None  # 배정된 작업자 정보
 
             if required_workers == 1:
-                # 어떤 account가 배정될지 선택 변수
-                worker_var = model.NewIntVar(
-                    0, num_accounts - 1,
-                    f"worker_{unique_task_key}"
-                )
-                assigned_worker = worker_var
+                # 🔥🔥 시간대 판별을 위한 Boolean 변수
+                is_day_shift_var = model.NewBoolVar(f"is_day_{unique_task_key}")
 
-                # 각 account에 대해 optional interval 생성
-                for acc_idx, acc_id in enumerate(account_ids):
-                    # 이 account가 배정되었을 때만 활성화
-                    is_assigned = model.NewBoolVar(
-                        f"assigned_{unique_task_key}_{acc_id}"
+                # end 시간의 하루 내 위치 계산 (0-1439)
+                time_of_day = model.NewIntVar(0, 1439, f"time_of_day_{unique_task_key}")
+                model.AddModuloEquality(time_of_day, end, 1440)
+
+                # 06:00(360분) <= time_of_day < 18:00(1080분)이면 주간
+                # 주간 조건: time_of_day >= 360 AND time_of_day < 1080
+                is_gte_360 = model.NewBoolVar(f"gte_360_{unique_task_key}")
+                is_lt_1080 = model.NewBoolVar(f"lt_1080_{unique_task_key}")
+
+                model.Add(time_of_day >= 360).OnlyEnforceIf(is_gte_360)
+                model.Add(time_of_day < 360).OnlyEnforceIf(is_gte_360.Not())
+                model.Add(time_of_day < 1080).OnlyEnforceIf(is_lt_1080)
+                model.Add(time_of_day >= 1080).OnlyEnforceIf(is_lt_1080.Not())
+
+                # 둘 다 True면 주간
+                model.AddBoolAnd([is_gte_360, is_lt_1080]).OnlyEnforceIf(is_day_shift_var)
+                model.AddBoolOr([is_gte_360.Not(), is_lt_1080.Not()]).OnlyEnforceIf(is_day_shift_var.Not())
+
+                # 주간 작업자 선택 (dayWorkers 중에서)
+                day_worker_var = None
+                if num_day_workers > 0:
+                    day_worker_var = model.NewIntVar(
+                        0, num_day_workers - 1,
+                        f"day_worker_{unique_task_key}"
                     )
-                    model.Add(worker_var == acc_idx).OnlyEnforceIf(is_assigned)
 
-                    # Optional interval: 이 account가 배정되었을 때만 활성화
-                    opt_interval = model.NewOptionalIntervalVar(
-                        start, task["duration"], end,
-                        is_assigned,
-                        f"opt_iv_{unique_task_key}_{acc_id}"
+                # 야간 작업자 선택 (nightWorkers 중에서)
+                night_worker_var = None
+                if num_night_workers > 0:
+                    night_worker_var = model.NewIntVar(
+                        0, num_night_workers - 1,
+                        f"night_worker_{unique_task_key}"
                     )
 
-                    # 이 account의 interval 리스트에 추가
-                    account_intervals[acc_id].append(opt_interval)
+                # 각 주간 작업자에 대해 Optional Interval 생성
+                if num_day_workers > 0:
+                    for acc_idx, acc_id in enumerate(day_worker_ids):
+                        # 조건: 주간이고(is_day_shift_var) AND 이 작업자가 선택됨(day_worker_var == acc_idx)
+                        is_this_day_worker = model.NewBoolVar(
+                            f"is_day_worker_{unique_task_key}_{acc_id}"
+                        )
+
+                        # is_this_day_worker = (is_day_shift_var AND day_worker_var == acc_idx)
+                        model.Add(day_worker_var == acc_idx).OnlyEnforceIf(is_this_day_worker)
+                        model.Add(day_worker_var != acc_idx).OnlyEnforceIf(is_this_day_worker.Not())
+
+                        # 최종 활성화 조건: 주간이면서 이 작업자가 선택됨
+                        is_active = model.NewBoolVar(f"active_day_{unique_task_key}_{acc_id}")
+                        model.AddBoolAnd([is_day_shift_var, is_this_day_worker]).OnlyEnforceIf(is_active)
+                        model.AddBoolOr([is_day_shift_var.Not(), is_this_day_worker.Not()]).OnlyEnforceIf(
+                            is_active.Not())
+
+                        opt_interval = model.NewOptionalIntervalVar(
+                            start, task["duration"], end,
+                            is_active,
+                            f"opt_day_iv_{unique_task_key}_{acc_id}"
+                        )
+                        day_account_intervals[acc_id].append(opt_interval)
+
+                # 각 야간 작업자에 대해 Optional Interval 생성
+                if num_night_workers > 0:
+                    for acc_idx, acc_id in enumerate(night_worker_ids):
+                        # 조건: 야간이고(is_day_shift_var.Not()) AND 이 작업자가 선택됨(night_worker_var == acc_idx)
+                        is_this_night_worker = model.NewBoolVar(
+                            f"is_night_worker_{unique_task_key}_{acc_id}"
+                        )
+
+                        # is_this_night_worker = (night_worker_var == acc_idx)
+                        model.Add(night_worker_var == acc_idx).OnlyEnforceIf(is_this_night_worker)
+                        model.Add(night_worker_var != acc_idx).OnlyEnforceIf(is_this_night_worker.Not())
+
+                        # 최종 활성화 조건: 야간이면서 이 작업자가 선택됨
+                        is_active = model.NewBoolVar(f"active_night_{unique_task_key}_{acc_id}")
+                        model.AddBoolAnd([is_day_shift_var.Not(), is_this_night_worker]).OnlyEnforceIf(is_active)
+                        model.AddBoolOr([is_day_shift_var, is_this_night_worker.Not()]).OnlyEnforceIf(is_active.Not())
+
+                        opt_interval = model.NewOptionalIntervalVar(
+                            start, task["duration"], end,
+                            is_active,
+                            f"opt_night_iv_{unique_task_key}_{acc_id}"
+                        )
+                        night_account_intervals[acc_id].append(opt_interval)
+
+                assigned_worker_info = {
+                    "is_day_shift": is_day_shift_var,
+                    "day_worker": day_worker_var,
+                    "night_worker": night_worker_var,
+                }
 
             task_worker_assignments[unique_task_key] = {
                 "start": start,
@@ -187,7 +271,7 @@ def solve_scenario(data):
                 "product_id": task["product_id"],
                 "task_id": task["task_id"],
                 "required_workers": task["required_workers"],
-                "assigned_worker": assigned_worker,  # 단일 변수
+                "assigned_worker": assigned_worker_info,
             }
 
             var_map[(pid, task["task_id"], task_counter)] = task_worker_assignments[unique_task_key]
@@ -206,11 +290,15 @@ def solve_scenario(data):
             worker_intervals_filtered.append(interval)
             worker_demands_filtered.append(demand)
 
+    # 주간/야간 최대 인원은 각각의 작업자 수로 설정
+    # 전체적인 제약은 시간대별로 나누어 적용
+    max_workers = max(num_day_workers, num_night_workers) if (num_day_workers > 0 or num_night_workers > 0) else 1
+
     if worker_intervals_filtered:
         model.AddCumulative(
             worker_intervals_filtered,
             worker_demands_filtered,
-            data["scenario"]["maxWorkerCount"] // 2
+            max_workers
         )
 
     for cat, intervals in tool_intervals.items():
@@ -225,38 +313,54 @@ def solve_scenario(data):
         model.AddNoOverlap(intervals)
 
     # 🆕 각 account별로 시간 겹침 방지 (동일 작업자 중복 배정 불가)
-    for acc_id, intervals in account_intervals.items():
+    for acc_id, intervals in day_account_intervals.items():
         if len(intervals) > 0:
             model.AddNoOverlap(intervals)
 
-    # 🆕🆕🆕 동시에 배정 가능한 작업자 수 제한 (maxWorkerCount / 2)
-    # requiredWorkers > 0인 작업만 카운트
-    max_concurrent_workers = data["scenario"]["maxWorkerCount"] // 2
+    for acc_id, intervals in night_account_intervals.items():
+        if len(intervals) > 0:
+            model.AddNoOverlap(intervals)
 
-    # 모든 작업의 시작/종료 시점에서 동시 배정된 작업자 수 체크
-    worker_assignment_intervals = []
-    worker_assignment_demands = []
+    # 🆕🆕🆕 시간대별 동시 작업 가능 인원 제한
+    # 주간: dayWorkers.size, 야간: nightWorkers.size
+    day_intervals = []
+    day_demands = []
+    night_intervals = []
+    night_demands = []
 
     for unique_task_key, task_info in task_worker_assignments.items():
-        # requiredWorkers > 0이고 작업자가 배정된 작업만 카운트
         if task_info["required_workers"] > 0 and task_info["assigned_worker"] is not None:
-            # 이 작업에 작업자가 배정되면 1명으로 카운트
-            worker_assignment_intervals.append(
-                model.NewIntervalVar(
+            is_day = task_info["assigned_worker"]["is_day_shift"]
+
+            # 주간 작업 interval
+            if num_day_workers > 0:
+                day_interval = model.NewOptionalIntervalVar(
                     task_info["start"],
                     task_info["duration"],
                     task_info["end"],
-                    f"worker_count_iv_{unique_task_key}"
+                    is_day,
+                    f"day_count_{unique_task_key}"
                 )
-            )
-            worker_assignment_demands.append(1)
+                day_intervals.append(day_interval)
+                day_demands.append(1)
 
-    if worker_assignment_intervals:
-        model.AddCumulative(
-            worker_assignment_intervals,
-            worker_assignment_demands,
-            max_concurrent_workers
-        )
+            # 야간 작업 interval
+            if num_night_workers > 0:
+                night_interval = model.NewOptionalIntervalVar(
+                    task_info["start"],
+                    task_info["duration"],
+                    task_info["end"],
+                    is_day.Not(),
+                    f"night_count_{unique_task_key}"
+                )
+                night_intervals.append(night_interval)
+                night_demands.append(1)
+
+    if day_intervals and num_day_workers > 0:
+        model.AddCumulative(day_intervals, day_demands, num_day_workers)
+
+    if night_intervals and num_night_workers > 0:
+        model.AddCumulative(night_intervals, night_demands, num_night_workers)
 
     makespan = model.NewIntVar(0, horizon, "makespan")
     model.AddMaxEquality(makespan, all_end_vars)
@@ -287,7 +391,14 @@ def solve_scenario(data):
         # 배정된 작업자 ID 추출 (0명 또는 1명)
         account_id = None
         if v["assigned_worker"] is not None:
-            account_id = account_ids[solver.Value(v["assigned_worker"])]
+            is_day = solver.Value(v["assigned_worker"]["is_day_shift"])
+
+            if is_day and v["assigned_worker"]["day_worker"] is not None:
+                worker_idx = solver.Value(v["assigned_worker"]["day_worker"])
+                account_id = day_worker_ids[worker_idx]
+            elif not is_day and v["assigned_worker"]["night_worker"] is not None:
+                worker_idx = solver.Value(v["assigned_worker"]["night_worker"])
+                account_id = night_worker_ids[worker_idx]
 
         timeline.append({
             "product_id": v["product_id"],
@@ -325,7 +436,7 @@ def solve_scenario(data):
                 task["tool_id"] = tools[0]  # 안전장치
 
     # -------------------------------
-    # 🔥 분석 계산 (완전 복구)
+    # 🔥 분석 계산
     # -------------------------------
     total_time = solver.Value(makespan)
 
@@ -351,9 +462,10 @@ def solve_scenario(data):
     total_worker_time = sum(
         t["duration"] * t["required_workers"] for t in timeline
     )
+    max_workers_total = num_day_workers + num_night_workers
     worker_util = total_worker_time / (
-            total_time * data["scenario"]["maxWorkerCount"]
-    )
+            total_time * max_workers_total
+    ) if max_workers_total > 0 else 0
 
     idle_times = []
     jobs = collections.defaultdict(list)
